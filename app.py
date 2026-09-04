@@ -5,6 +5,7 @@ import time
 import base64
 import io
 import re
+import logging
 from typing import List, Optional
 import numpy as np
 import cv2
@@ -18,7 +19,7 @@ MAX_TIMESTAMP_DIFF_SEC = 600
 
 app = FastAPI(title="PointCraft Cloud OCR Server")
 
-# High-Precision PC-Grade ONNX Engine (~90MB RAM, Full PC Accuracy)
+# High-Precision PC-Grade ONNX Engine
 ocr_engine = RapidOCR()
 
 class TeamModel(BaseModel):
@@ -47,12 +48,17 @@ def verify_hmac_signature(timestamp: str, body_bytes: bytes, signature: str):
     if not hmac.compare_digest(computed_sig, signature):
         raise HTTPException(status_code=403, detail="Invalid HMAC-SHA256 signature")
 
-def base64_to_cv2(b64_str: str) -> np.ndarray:
-    img_data = base64.b64decode(b64_str)
-    image = Image.open(io.BytesIO(img_data)).convert('RGB')
-    np_img = np.array(image)
-    # Convert RGB to BGR for OpenCV / RapidOCR
-    return np_img[:, :, ::-1]
+def base64_to_cv2(b64_str: str) -> Optional[np.ndarray]:
+    try:
+        if not b64_str or len(b64_str.strip()) < 10:
+            return None
+        img_data = base64.b64decode(b64_str)
+        image = Image.open(io.BytesIO(img_data)).convert('RGB')
+        np_img = np.array(image)
+        return np_img[:, :, ::-1] # RGB to BGR for OpenCV
+    except Exception as e:
+        logging.warning(f"Failed to decode base64 image: {e}")
+        return None
 
 def normalize_text(s: str) -> str:
     if not s:
@@ -93,74 +99,79 @@ async def scan_endpoint(
     unmatched_groups = []
     
     for img_b64 in req_data.images:
-        cv_img = base64_to_cv2(img_b64)
-        
-        # Resize image to max 960px for 10x faster OCR processing on CPU (~1.5s instead of ~18s)
-        h, w = cv_img.shape[:2]
-        max_dim = 960
-        if max(h, w) > max_dim:
-            scale = max_dim / float(max(h, w))
-            new_w = int(w * scale)
-            new_h = int(h * scale)
-            cv_img = cv2.resize(cv_img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        try:
+            cv_img = base64_to_cv2(img_b64)
+            if cv_img is None:
+                continue
 
-        ocr_res, elapse = ocr_engine(cv_img)
+            # Scale up small crop strips (e.g. height < 60px) so RapidOCR can read small text easily
+            h, w = cv_img.shape[:2]
+            if h < 60:
+                scale = 60.0 / float(h)
+                new_w = int(w * scale)
+                new_h = int(h * scale)
+                cv_img = cv2.resize(cv_img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
 
-        lines = []
-        if ocr_res:
-            for item in ocr_res:
-                text = item[1]
-                conf = float(item[2])
-                if conf > 0.35 and text.strip():
-                    lines.append(text.strip())
+            ocr_res, elapse = ocr_engine(cv_img)
 
-        current_placement = None
-        current_kills = 0
-        found_players = []
+            lines = []
+            if ocr_res:
+                for item in ocr_res:
+                    text = item[1]
+                    conf = float(item[2])
+                    if conf > 0.35 and text.strip():
+                        lines.append(text.strip())
 
-        for line in lines:
-            m_rank = re.search(r'#?(\d{1,2})', line)
-            if not current_placement and m_rank:
-                val = int(m_rank.group(1))
-                if 1 <= val <= 12:
-                    current_placement = val
+            current_placement = None
+            current_kills = 0
+            found_players = []
 
-            m_elim = re.search(r'(\d{1,2})\s*(?:elim|kill|elimination)', line, re.IGNORECASE)
-            if m_elim:
-                current_kills += int(m_elim.group(1))
+            for line in lines:
+                m_rank = re.search(r'#?(\d{1,2})', line)
+                if not current_placement and m_rank:
+                    val = int(m_rank.group(1))
+                    if 1 <= val <= 12:
+                        current_placement = val
+
+                m_elim = re.search(r'(\d{1,2})\s*(?:elim|kill|elimination)', line, re.IGNORECASE)
+                if m_elim:
+                    current_kills += int(m_elim.group(1))
+                else:
+                    if len(line) >= 2 and not line.isdigit():
+                        found_players.append(line)
+
+            matched_team = None
+            best_overlap = 0.0
+
+            if req_data.teams and found_players:
+                for team in req_data.teams:
+                    common = 0
+                    for p_ocr in found_players:
+                        for p_roster in team.players:
+                            if is_name_match(p_ocr, p_roster):
+                                common += 1
+                                break
+                    overlap = common / max(1, len(found_players))
+                    if overlap > best_overlap:
+                        best_overlap = overlap
+                        matched_team = team
+
+            if matched_team and best_overlap >= 0.25:
+                matched_results.append({
+                    "teamId": matched_team.id,
+                    "teamName": matched_team.name,
+                    "placement": current_placement if current_placement else 1,
+                    "kills": current_kills
+                })
             else:
-                if len(line) >= 2 and not line.isdigit():
-                    found_players.append(line)
-
-        matched_team = None
-        best_overlap = 0.0
-
-        if req_data.teams and found_players:
-            for team in req_data.teams:
-                common = 0
-                for p_ocr in found_players:
-                    for p_roster in team.players:
-                        if is_name_match(p_ocr, p_roster):
-                            common += 1
-                            break
-                overlap = common / max(1, len(found_players))
-                if overlap > best_overlap:
-                    best_overlap = overlap
-                    matched_team = team
-
-        if matched_team and best_overlap >= 0.25:
-            matched_results.append({
-                "teamId": matched_team.id,
-                "teamName": matched_team.name,
-                "placement": current_placement if current_placement else 1,
-                "kills": current_kills
-            })
-        else:
-            unmatched_groups.append({
-                "placement": current_placement if current_placement else 1,
-                "kills": current_kills,
-                "players": found_players
-            })
+                unmatched_groups.append({
+                    "placement": current_placement if current_placement else 1,
+                    "kills": current_kills,
+                    "players": found_players
+                })
+        except Exception as img_err:
+            logging.error(f"Error processing single image crop: {img_err}")
+            continue
 
     return {
         "success": True,
