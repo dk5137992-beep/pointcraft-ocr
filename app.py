@@ -10,14 +10,15 @@ import numpy as np
 from PIL import Image
 from fastapi import FastAPI, Request, HTTPException, Header
 from pydantic import BaseModel
-from paddleocr import PaddleOCR
+from rapidocr_onnxruntime import RapidOCR
 
 SECRET_KEY = os.environ.get("SECRET_KEY", "pointcraft_secret_key_change_me_in_production")
 MAX_TIMESTAMP_DIFF_SEC = 600
 
 app = FastAPI(title="PointCraft Cloud OCR Server")
 
-ocr_engine = PaddleOCR(use_angle_cls=True, lang="en")
+# High-Precision PC-Grade ONNX Engine (~90MB RAM, Full PC Accuracy)
+ocr_engine = RapidOCR()
 
 class TeamModel(BaseModel):
     id: str
@@ -90,12 +91,13 @@ async def scan_endpoint(
     
     for img_b64 in req_data.images:
         cv_img = base64_to_cv2(img_b64)
-        ocr_res = ocr_engine.ocr(cv_img, cls=True)
+        ocr_res, elapse = ocr_engine(cv_img)
 
         lines = []
-        if ocr_res and len(ocr_res) > 0 and ocr_res[0]:
-            for box in ocr_res[0]:
-                text, conf = box[1]
+        if ocr_res:
+            for item in ocr_res:
+                text = item[1]
+                conf = float(item[2])
                 if conf > 0.35 and text.strip():
                     lines.append(text.strip())
 
