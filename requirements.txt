@@ -1,0 +1,8 @@
+fastapi==0.110.0
+uvicorn==0.28.0
+pydantic==2.6.4
+numpy==1.26.4
+Pillow==10.2.0
+opencv-python-headless==4.9.0.80
+paddlepaddle==2.6.0
+paddleocr==2.7.3
