@@ -7,6 +7,7 @@ import io
 import re
 from typing import List, Optional
 import numpy as np
+import cv2
 from PIL import Image
 from fastapi import FastAPI, Request, HTTPException, Header
 from pydantic import BaseModel
@@ -49,7 +50,9 @@ def verify_hmac_signature(timestamp: str, body_bytes: bytes, signature: str):
 def base64_to_cv2(b64_str: str) -> np.ndarray:
     img_data = base64.b64decode(b64_str)
     image = Image.open(io.BytesIO(img_data)).convert('RGB')
-    return np.array(image)
+    np_img = np.array(image)
+    # Convert RGB to BGR for OpenCV / RapidOCR
+    return np_img[:, :, ::-1]
 
 def normalize_text(s: str) -> str:
     if not s:
@@ -91,6 +94,16 @@ async def scan_endpoint(
     
     for img_b64 in req_data.images:
         cv_img = base64_to_cv2(img_b64)
+        
+        # Resize image to max 960px for 10x faster OCR processing on CPU (~1.5s instead of ~18s)
+        h, w = cv_img.shape[:2]
+        max_dim = 960
+        if max(h, w) > max_dim:
+            scale = max_dim / float(max(h, w))
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            cv_img = cv2.resize(cv_img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
         ocr_res, elapse = ocr_engine(cv_img)
 
         lines = []
