@@ -17,7 +17,7 @@ MAX_TIMESTAMP_DIFF_SEC = 600
 
 app = FastAPI(title="PointCraft Cloud OCR Server")
 
-ocr_engine = PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
+ocr_engine = PaddleOCR(use_angle_cls=True, lang="en")
 
 class TeamModel(BaseModel):
     id: str
